@@ -1,4 +1,5 @@
 import os
+import sys
 import tempfile
 import time
 import uuid
@@ -419,9 +420,158 @@ class MediaCache:
 # Subtitle renderer (RGB + mask; output frames are RGB, no alpha channel)
 # =============================================================================
 
+def _normalize_rgba(value: Any, default: Tuple[int, int, int, int] = (0, 0, 0, 255)) -> Tuple[int, int, int, int]:
+    """Coerce a loosely-typed colour into an (r, g, b, a) int tuple.
+
+    The LLM calls this node with colours in whatever shape it likes. Observed
+    in a real MCP run: ``font_color=['255','255','255','255']`` (a list of
+    *strings*) reached Pillow's ``multiline_text`` and raised
+    ``TypeError: 'str' object cannot be interpreted as an integer`` -- which
+    burned two tool retries before the agent happened to drop the argument.
+
+    Accepts: (r,g,b[,a]) int tuple/list, list/tuple of numeric strings,
+    "255,255,255,255" / "255,255,255" / "#FFFFFF" / "#FFFFFFFF" / "white",
+    a single int (grey). Returns ``default`` when nothing sensible is given.
+    """
+
+    def _mk(nums: List[int]) -> Tuple[int, int, int, int]:
+        if len(nums) == 3:
+            nums = list(nums) + [255]
+        clamped = [max(0, min(255, int(n))) for n in nums[:4]]
+        while len(clamped) < 4:
+            clamped.append(255)
+        return (clamped[0], clamped[1], clamped[2], clamped[3])
+
+    if value is None:
+        return default
+    if isinstance(value, str):
+        s = value.strip()
+        if s.startswith("#"):
+            hexs = s[1:]
+            if len(hexs) in (6, 8):
+                try:
+                    nums = [int(hexs[i:i + 2], 16) for i in range(0, len(hexs), 2)]
+                except ValueError:
+                    return default
+                return _mk(nums)
+            return default
+        if "," in s:
+            parts = [p.strip() for p in s.split(",") if p.strip()]
+        else:
+            parts = [s]
+        nums: List[int] = []
+        for p in parts:
+            try:
+                nums.append(int(float(p)))
+            except ValueError:
+                if p.lower() in _NAMED_COLORS:
+                    r, g, b = _NAMED_COLORS[p.lower()]
+                    nums.extend([r, g, b])
+                else:
+                    return default
+        if len(nums) not in (3, 4):
+            return default
+        return _mk(nums)
+    if isinstance(value, int):
+        v = max(0, min(255, value))
+        return (v, v, v, 255)
+    if isinstance(value, (list, tuple)):
+        nums = []
+        for p in value:
+            if isinstance(p, (int, float)):
+                nums.append(int(p))
+            elif isinstance(p, str):
+                try:
+                    nums.append(int(float(p.strip())))
+                except ValueError:
+                    return default
+            else:
+                return default
+        if len(nums) not in (3, 4):
+            return default
+        return _mk(nums)
+    return default
+
+
+def _font_cmap(font_path: str) -> Optional[set]:
+    """Return the set of codepoints the font actually has glyphs for.
+
+    Uses fontTools' real ``cmap`` table -- no rasterisation heuristics. The
+    rasterised-mask approach was tried first and was WRONG in both
+    directions: it falsely flagged CP_Revenge as missing 與/彩/畫 (it has
+    them), and falsely cleared 标小智无界黑 (it is missing 與/畫/測/試).
+    A wrong fallback is worse than no fallback, so read the cmap.
+    """
+    if not font_path:
+        return None
+    cached = _FONT_CMAP_CACHE.get(font_path)
+    if cached is not None:
+        return cached
+    try:
+        from fontTools.ttLib import TTFont  # type: ignore[import-not-found]
+
+        tt = TTFont(font_path, fontNumber=0, lazy=True)
+        order = tt.getGlyphOrder()
+        best = None
+        for table in tt["cmap"].tables:
+            if best is None or len(table.cmap) > len(best.cmap):
+                best = table
+        chars: Optional[set] = set()
+        if best is not None:
+            for codepoint, glyph_name in best.cmap.items():
+                # A cmap entry that points at glyph 0 (.notdef) is NOT a real
+                # glyph -- the character still renders as a hollow box.
+                try:
+                    if order.index(glyph_name) == 0:
+                        continue
+                except ValueError:
+                    continue
+                chars.add(codepoint)
+        tt.close()
+    except Exception:
+        chars = None
+    if chars is None:
+        return None
+    _FONT_CMAP_CACHE[font_path] = chars
+    return chars
+
+
+_FONT_CMAP_CACHE: dict = {}
+
+
+def _mask_bytes(font: ImageFont.FreeTypeFont, ch: str) -> bytes:
+    """Rasterise one character and return its raw mask bytes.
+
+    Used to detect .notdef ("tofu") glyphs without needing a cmap parser:
+    a missing character renders exactly like any other missing character.
+    """
+    mask = font.getmask(ch)
+    return bytes(mask)  # type: ignore[arg-type]
+
+
+_CJK_PROBE_CHARS = (
+    "測試與畫面校正色彩呈現銳利飽和和階宣傳片教會香港靈糧堂主日崇拜"
+    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+)
+
+_NAMED_COLORS = {
+    "white": (255, 255, 255),
+    "black": (0, 0, 0),
+    "red": (255, 0, 0),
+    "green": (0, 128, 0),
+    "blue": (0, 0, 255),
+    "yellow": (255, 255, 0),
+    "cyan": (0, 255, 255),
+    "magenta": (255, 0, 255),
+    "gray": (128, 128, 128),
+    "grey": (128, 128, 128),
+}
+
+
 class PillowSubtitleRenderer:
     def __init__(self, font_path: str) -> None:
         self._font_path = font_path
+        self._fallback_font_paths: List[str] = []
 
     def render(
         self,
@@ -492,7 +642,7 @@ class PillowSubtitleRenderer:
         if dur <= 0:
             return None
 
-        font = self._load_font(font_size)
+        font = self._select_font(font_size, text)
 
         max_text_w = max(1, int(canvas_w * SUBTITLE_MAX_WIDTH_RATIO))
         wrapped = self._wrap_text_by_width(text, font, max_text_w)
@@ -536,6 +686,58 @@ class PillowSubtitleRenderer:
         except Exception:
             pass
         return ImageFont.load_default()
+
+    @staticmethod
+    def _font_covers(font: ImageFont.FreeTypeFont, text: str) -> bool:
+        """True when the font has a real glyph for every character in ``text``.
+
+        Primary check reads the font's real ``cmap`` table via fontTools.
+        The rasterised-mask fallback below is only used when fontTools is
+        unavailable -- and it is known to be unreliable (it can both invent
+        missing glyphs and hide real ones), so it is never the deciding
+        factor when a cmap is readable.
+        """
+        path = getattr(font, "path", None)
+        cmap = _font_cmap(path) if path else None
+        if cmap is not None:
+            return all(ord(ch) in cmap for ch in set(text)
+                       if ch not in ("\n", "\r", "\t"))
+        try:
+            reference = _mask_bytes(font, "\U000E0100")
+        except Exception:
+            return True
+        for ch in set(text):
+            if ch in ("\n", "\r", "\t"):
+                continue
+            try:
+                if _mask_bytes(font, ch) == reference:
+                    return False
+            except Exception:
+                return False
+        return True
+
+    def _select_font(self, font_size: int, text: str) -> ImageFont.FreeTypeFont:
+        """Pick a font that can actually render ``text``.
+
+        The recommended "花字" fonts are display faces; several of them only
+        carry Simplified-Chinese glyphs, so traditional-Chinese subtitles
+        (與 / 畫 / 測 / 試 / 靈 / 糧 ...) silently rendered as hollow boxes in
+        a real MCP E2E run. Keep the recommended face whenever it covers the
+        text, otherwise fall back to the first chain font that does.
+        """
+        primary = self._load_font(font_size)
+        if self._font_covers(primary, text):
+            return primary
+        for path in self._fallback_font_paths:
+            if not path or not os.path.exists(path):
+                continue
+            try:
+                candidate = ImageFont.truetype(font=path, size=font_size)
+            except Exception:
+                continue
+            if self._font_covers(candidate, text):
+                return candidate
+        return primary
 
     @staticmethod
     def _wrap_text_by_width(text: str, font: ImageFont.FreeTypeFont, max_width_px: int) -> str:
@@ -694,6 +896,39 @@ class RenderVideoPipeline:
         with open(font_info_path, encoding='utf-8') as f:
             self.font_info = json.load(f)
         self._fontname2path = {font['font_name']: font['font_path'] for font in self.font_info}
+        self._fallback_font_cache: Optional[List[str]] = None
+
+    def _fallback_font_paths(self) -> List[str]:
+        """Font chain used when the recommended face cannot render the text.
+
+        Several recommended display faces only carry Simplified-Chinese
+        glyphs (CP_Revenge, PingFangXingChenTi, HanChanShouZhuoTi, ...), so
+        traditional-Chinese subtitles rendered as hollow boxes in a real MCP
+        E2E run. The chain is ordered by CJK coverage: the packaged fonts
+        that cover the most, then the system's own CJK fonts as a last
+        resort.
+        """
+        if self._fallback_font_cache is not None:
+            return self._fallback_font_cache
+
+        packaged = [f.get("font_path") for f in self.font_info if f.get("font_path")]
+        system = [
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+        ]
+
+        def score(path: str) -> int:
+            cmap = _font_cmap(path)
+            if cmap is None:
+                return -1
+            return sum(1 for ch in _CJK_PROBE_CHARS if ord(ch) in cmap)
+
+        candidates = [p for p in packaged + system if p and os.path.exists(p)]
+        ranked = sorted(candidates, key=score, reverse=True)
+        self._fallback_font_cache = ranked
+        return ranked
 
     async def render(self, *, node_state: NodeState, inputs: Dict[str, Any]) -> Dict[str, Any]:
         load_media: Dict[str, Any] = inputs["load_media"]
@@ -704,7 +939,7 @@ class RenderVideoPipeline:
         crf = inputs.get('crf', DEFAULT_CRF)
         clip_compose_mode = inputs.get('clip_compose_mode', 'crop')  # one of `padding` and `crop`
         bg_color = inputs.get('bg_color')
-        font_color = inputs.get('font_color')
+        font_color = _normalize_rgba(inputs.get('font_color'), SUBTITLE_FONT_COLOR)
         font_size = inputs.get('font_size')
         margin_bottom = inputs.get('margin_bottom')
         bgm_volume_scale = inputs.get('bgm_volume_scale')
@@ -712,7 +947,7 @@ class RenderVideoPipeline:
         include_video_audio = inputs.get('include_video_audio')
         video_volume_scale = inputs.get('video_volume_scale')
         stroke_width = inputs.get('stroke_width')
-        stroke_color = inputs.get('stroke_color')
+        stroke_color = _normalize_rgba(inputs.get('stroke_color'), SUBTITLE_STROKE_COLOR)
 
         artifact_id: str = node_state.artifact_id
         session_id: str = node_state.session_id
@@ -739,6 +974,11 @@ class RenderVideoPipeline:
         
         font_path = self._fontname2path.get(text_rec[0]['font_name']) if len(text_rec) > 0 else None
         subtitle_renderer = PillowSubtitleRenderer(font_path=font_path)
+        # Fallback chain: several recommended display faces only carry
+        # Simplified-Chinese glyphs, so traditional-Chinese subtitles would
+        # render as hollow boxes. Offer every known font (plus the system's
+        # CJK fonts) as fallbacks, best-covering first.
+        subtitle_renderer._fallback_font_paths = list(self._fallback_font_paths())
         audio_composer = AudioTrackComposer(cache=cache)
 
         temp_dir = tempfile.mkdtemp(prefix=TEMP_DIRECTORY_PREFIX)
@@ -803,17 +1043,101 @@ class RenderVideoPipeline:
             
             FFMPEG_PARAMS[3] = f"{crf}" # set crf (video quality setting), default is 23 (medium quality)
 
-            await asyncio.to_thread(
-                final_clip.write_videofile,
-                output_path,
-                codec=VIDEO_CODEC,
-                audio_codec=AUDIO_CODEC,
-                temp_audiofile=os.path.join(temp_dir, TEMP_AUDIO_FILENAME),
-                remove_temp=True,
-                fps=output_fps,
-                ffmpeg_params=FFMPEG_PARAMS,
-                logger=logger,
-            )
+            # Fast path: burn the already-rasterized subtitle PNGs with a single
+            # ffmpeg filtergraph instead of compositing every frame in Python.
+            # The MoviePy composite runs at ~1x realtime regardless of machine
+            # speed; the filtergraph runs at ~15-20x. Falls back on any failure.
+            rendered_with_filtergraph = False
+            if subtitle_clips:
+                try:
+                    from open_storyline.utils.filtergraph_render import (
+                        overlay_from_subtitle_clip,
+                        burn_subtitles_with_ffmpeg,
+                    )
+
+                    overlays = []
+                    for sub_clip in subtitle_clips:
+                        ov = overlay_from_subtitle_clip(
+                            sub_clip, temp_dir, canvas_size=output_canvas_size
+                        )
+                        if ov is None:
+                            raise RuntimeError("subtitle clip not representable as a static overlay")
+                        overlays.append(ov)
+
+                    # The base video is encoded to a LOSSLESS intermediate so the
+                    # final subtitle burn-in is the only lossy generation. A
+                    # lossy intermediate would compound with the final encode
+                    # and degrade the picture relative to the MoviePy path.
+                    base_only_path = os.path.join(temp_dir, "base_video.mkv")
+                    base_clip.write_videofile(
+                        base_only_path,
+                        fps=output_fps,
+                        codec=VIDEO_CODEC,
+                        audio=False,
+                        remove_temp=True,
+                        logger=None,
+                        ffmpeg_params=[
+                            "-preset", "ultrafast",
+                            "-crf", "0",
+                            "-threads", "0",
+                        ],
+                    )
+
+                    audio_for_render = None
+                    if final_clip is not None and getattr(final_clip, "audio", None) is not None:
+                        candidate = os.path.join(temp_dir, TEMP_AUDIO_FILENAME)
+                        try:
+                            # codec must be explicit: MoviePy infers 'libfdk_aac' when left
+                            # unset, and most ffmpeg builds (including this host's) do not have it.
+                            final_clip.audio.write_audiofile(candidate, codec=AUDIO_CODEC, logger=None)
+                            if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+                                audio_for_render = candidate
+                        except Exception as audio_exc:
+                            # Losing the mixed audio track is recoverable; losing the render is not.
+                            print(
+                                f"[render_video] filtergraph path: audio export failed "
+                                f"({audio_exc!r}); rendering video only",
+                                file=sys.stderr,
+                            )
+
+                    burn_subtitles_with_ffmpeg(
+                        base_only_path,
+                        overlays,
+                        output_path,
+                        fps=int(output_fps),
+                        crf=int(crf),
+                        audio_source=audio_for_render,
+                    )
+                    rendered_with_filtergraph = True
+                    print(
+                        "[render_video] RENDERED_WITH_FFMPEG_FILTERGRAPH "
+                        f"(base={os.path.basename(base_only_path)} "
+                        f"overlays={len(overlays)} "
+                        f"out={os.path.basename(output_path)})",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    report(float(final_duration_s), float(final_duration_s),
+                          "rendering 100.0%")
+                except Exception as exc:  # pragma: no cover - fallback path
+                    print(
+                        f"[render_video] ffmpeg filtergraph render unavailable "
+                        f"({exc!r}); falling back to MoviePy composite",
+                        file=sys.stderr,
+                    )
+
+            if not rendered_with_filtergraph:
+                await asyncio.to_thread(
+                    final_clip.write_videofile,  # type: ignore[union-attr]
+                    output_path,
+                    codec=VIDEO_CODEC,
+                    audio_codec=AUDIO_CODEC,
+                    temp_audiofile=os.path.join(temp_dir, TEMP_AUDIO_FILENAME),
+                    remove_temp=True,
+                    fps=output_fps,
+                    ffmpeg_params=FFMPEG_PARAMS,
+                    logger=logger,
+                )
 
             node_state.node_summary.info_for_user(
                 f"Video generated successfully, duration: {final_duration_s} seconds, path: {output_path}",

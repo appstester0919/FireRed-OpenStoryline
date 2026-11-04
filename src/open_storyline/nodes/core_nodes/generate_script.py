@@ -58,7 +58,7 @@ class GenerateScriptNode(BaseNode):
                 subtitle_index = 1
 
                 validate_subtitle_format(custom_script)
-                edit_group_scripts = custom_script['group_scripts']
+                edit_group_scripts = normalize_group_scripts(custom_script['group_scripts'])
                 # fill subtitle_units
                 for i in range(len(edit_group_scripts)):
                     raw_text = edit_group_scripts[i]['raw_text']
@@ -336,13 +336,48 @@ def _make_subtitle_units(
         cur += 1
     return units, cur
 
+def normalize_group_scripts(raw: Any) -> list:
+    """Coerce the LLM-supplied ``group_scripts`` into a list of group dicts.
+
+    The agent calls this node with whatever shape it likes. Observed in a real
+    MCP run: ``custom_script={'group_scripts': {'item': {'group_id': ...,
+    'raw_text': ...}}}`` -- a dict wrapping a single group under an ``item``
+    key instead of a plain list. The old validation iterated the dict, which
+    yields its *keys* (strings), so it raised
+    ``ValueError: group missing field 'group_id'`` and the agent retried the
+    same malformed call four times in a row.
+
+    Handles: a list of groups, a dict wrapping one list under a known key, a
+    mapping of name -> group, and a single bare group dict.
+    """
+    if isinstance(raw, list):
+        return [g for g in raw if isinstance(g, dict)]
+    if isinstance(raw, dict):
+        for key in ("item", "items", "groups", "group_scripts", "script",
+                    "scripts", "data", "result"):
+            inner = raw.get(key)
+            if isinstance(inner, (dict, list)):
+                normalized = normalize_group_scripts(inner)
+                if normalized:
+                    return normalized
+        values = [v for v in raw.values() if isinstance(v, dict)]
+        if values:
+            return values
+        if "group_id" in raw or "raw_text" in raw:
+            return [raw]
+    return []
+
+
 def validate_subtitle_format(data: dict[str, Any]):
     if "group_scripts" not in data:
         raise ValueError("input missing field 'group_scripts'")
 
     if "title" not in data:
         raise ValueError("input missing field 'title'")
-    for group in data["group_scripts"]:
+    groups = normalize_group_scripts(data["group_scripts"])
+    if not groups:
+        raise ValueError("input missing field 'group_scripts'")
+    for group in groups:
         if "group_id" not in group:
             raise ValueError("group missing field 'group_id'")
         if "raw_text" not in group:
